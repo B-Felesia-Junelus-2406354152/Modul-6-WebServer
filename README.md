@@ -232,3 +232,106 @@ Kemudian ketika kita menjalankan kode tersebut, kita mencoba untuk mengakses `12
 
 Hal ini terjadi karena program server yang kita buat berjalan secara single-threaded, artinya ia hanya memiliki satu jalur eksekusi instruksi dari awal hingga akhir. Ketika Tab 1 mengakses `/sleep`, permintaan tersebut masuk ke fungsi `handle_connection`. Kemudian program akan mengeksekusi `thread::sleep(Duration::from_secs(10))`, yang menghentikan total seluruh eksekusi thread utama tersebut selama 10 detik. Kemudian pada saat yang hampir bersamaan, Tab 2 mengirimkan permintaan koneksi. Sistem operasi komputer menerima koneksi TCP dari Tab 2 dan menaruhnya di antrean (queue). Namun, karena thread utama aplikasi Rust kita sedang membeku memproses Tab 1, program tidak bisa melanjutkan iterasi pada loop `for stream in listener.incoming()` untuk mengambil dan memproses stream milik Tab 2. Akibatnya, permintaan Tab 2 sepenuhnya tertahan (blocked) hingga proses `sleep ` Tab 1 selesai, dokumen HTML dikirim ke Tab 1, dan fungsi `handle_connection` pertama selesai dieksekusi.
 
+## Reflection Commit 5 - Multithreaded Server
+
+Pada tahap ini, kita berhasil menyelesaikan masalah antrean lambat (seperti rute /sleep pada Commit 4) dengan mengubah server dari single-threaded menjadi multithreaded menggunakan arsitektur ThreadPool. Hal ini dilakukan dengan mengubah sedikit file `main.rs` dan menambahkan file `lib.rs`.
+
+```
+// main.rs
+use hello::ThreadPool;
+
+fn main() {
+    let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+    let pool = ThreadPool::new(4);
+
+    for stream in listener.incoming() {
+        let stream = stream.unwrap();
+
+        pool.execute(|| {
+            handle_connection(stream);
+        });
+    }
+}
+```
+
+```
+// lib.rs
+use std::{
+    sync::{mpsc, Arc, Mutex},
+    thread::{self, JoinHandle},
+};
+
+pub struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: mpsc::Sender<Job>,
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+impl ThreadPool {
+    pub fn new(size: usize) -> ThreadPool {
+        assert!(size > 0);
+
+        let (sender, receiver) = mpsc::channel();
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        let mut workers = Vec::with_capacity(size);
+
+        for id in 0..size {
+            workers.push(Worker::new(id, Arc::clone(&receiver)));
+        }
+
+        ThreadPool { workers, sender }
+    }
+
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job = Box::new(f);
+
+        self.sender.send(job).unwrap();
+    }
+}
+
+struct Worker {
+    id: usize,
+    thread: thread::JoinHandle<()>,
+}
+
+impl Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+        let thread = thread::spawn(move || loop {
+            let job = receiver.lock().unwrap().recv().unwrap();
+            println!("Worker {id} got a job; executing.");
+            job();
+        });
+
+        Worker { id, thread }
+    }
+}
+```
+
+Konsep utama dari ThreadPool adalah kita menyiapkan sekelompok "pekerja" (workers) di awal. Ketika ada permintaan masuk, server tidak mengerjakannya sendiri, melainkan melemparkan pekerjaan tersebut ke dalam antrean untuk dikerjakan oleh pekerja yang sedang menganggur.
+
+Pada `src/main.rs`, potongan kode `let pool = ThreadPool::new(4);` membuat sebuah pool (kelompok) yang berisi 4 pekerja (thread). Kemudian setiap kali ada koneksi dari browser (stream), `pool.execute(|| { handle_connection(stream); });` akan membungkus fungsi `handle_connection` di dalam sebuah closure `|| { ... }`. Closure ini merupakan sebuah "paket tugas" yang diserahkan ke pool.
+
+Lalu cara kerjanya dapat kita lihat pada `src/lib.rs`,
+
+1. `type Job = Box<dyn FnOnce() + Send + 'static>;` mendefinisikan pekerjaan yang merupakan closure yang dikirim dari `main.rs`. Kita menggunakan Box untuk mengalokasikan memori secara dinamis, dan Send untuk memastikan tugas ini aman dikirim ke thread lain.
+
+2. `let (sender, receiver) = mpsc::channel();`
+Instruksi ini menginisialisasi saluran komunikasi Multiple Producer, Single Consumer (mpsc) yang berfungsi untuk mendistribusikan beban kerja dari ThreadPool selaku entitas pengirim kepada para pekerja selaku entitas penerima.
+
+3. `let receiver = Arc::new(Mutex::new(receiver));`
+Konstruksi Arc yang membungkus Mutex berfungsi untuk mendistribusikan hak akses saluran antrean tugas secara aman ke seluruh pekerja, sekaligus menjamin eksklusivitas agar hanya satu pekerja yang dapat mengambil tugas pada satu waktu tanpa memicu bentrokan data (data race).
+
+4. `workers.push(Worker::new(id, Arc::clone(&receiver)));`
+Proses ini menginisialisasi setiap pekerja dengan ID unik dan salinan referensi aman (Arc::clone) menuju saluran penerima, lalu mengumpulkannya ke dalam pool agar seluruh pekerja terhubung pada antrean tugas yang sama.
+
+5. Fungsi `execute` pada `ThreadPool`
+Saat ada tugas baru dari `main.rs`, fungsi ini akan mengambil tugas tersebut lalu mengeksekusi `self.sender.send(job).unwrap()`. Ini artinya, pool melempar tugas tersebut ke dalam saluran komunikasi agar ditangkap oleh pekerja.
+
+6. Proses Pekerja di `Worker::new`
+Di dalam pembuatan Worker, kita menjalankan thread baru dengan `thread::spawn`. Di dalamnya terdapat loop `{ ... }` (perulangan tanpa henti). `let job = receiver.lock().unwrap().recv().unwrap();` akan memerintahkan pekerja untuk mengunci saluran penerima secara eksklusif dan menunda eksekusinya (bersiaga) hingga sebuah tugas baru berhasil ditangkap untuk diproses. Lalu pada instruksi `job();`, pekerja mengeksekusi tugas tersebut. Setelah selesai, pekerja akan kembali ke awal loop dan bersiap menerima tugas berikutnya.
+
