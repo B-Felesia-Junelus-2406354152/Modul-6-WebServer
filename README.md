@@ -185,3 +185,50 @@ fn handle_connection(mut stream: TcpStream) {
 Ketika pertama kali mengimplementasikan logika if-else ini, kode untuk membaca file, menghitung panjang teks, menyatukan header, dan mengirimkan balasan ke stream ditulis sebanyak dua kali (satu di dalam if, satu lagi di dalam else). Pendekatan ini melanggar prinsip desain Don't Repeat Yourself (DRY).
 
 Refactoring sangat krusial dilakukan untuk menghindari kode yang repetitif. Dengan melakukan refactoring, kita menyederhanakan blok if-else sehingga hanya bertugas untuk menentukan dua variabel utama, yaitu `status_line` dan `filename`. Setelah variabel tersebut ditentukan, proses membaca file, merakit format HTTP, dan menuliskannya ke TCP stream cukup dituliskan satu kali saja di luar blok kondisi. Hasilnya, kode menjadi jauh lebih bersih, ringkas, dan lebih mudah dikembangkan jika ke depannya kita ingin menambahkan routing ke banyak halaman baru.
+
+## Reflection Commit 4 - Simulation Slow Response
+
+Pada tahap ini, kita melakukan modifikasi untuk mensimulasikan skenario respons yang lambat (slow request) untuk melihat kelemahan utama dari arsitektur single-threaded web server.
+
+```
+fn handle_connection(mut stream: TcpStream) {
+    let buf_reader = BufReader::new(&mut stream);
+    let request_line = buf_reader.lines().next().unwrap().unwrap();
+
+    let (status_line, filename) = match &request_line[..] {
+        "GET / HTTP/1.1" => ("HTTP/1.1 200 OK", "hello.html"),
+        "GET /sleep HTTP/1.1" => {
+            thread::sleep(Duration::from_secs(10));
+            ("HTTP/1.1 200 OK", "hello.html")
+        }
+        _ => ("HTTP/1.1 404 NOT FOUND", "404.html"),
+    };
+
+    let contents = fs::read_to_string(filename).unwrap();
+    let length = contents.len();
+
+    let response = format!(
+        "{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}"
+    );
+
+    stream.write_all(response.as_bytes()).unwrap();
+}
+```
+
+Logika routing yang sebelumnya menggunakan blok if-else kini diganti dengan match. Struktur match jauh lebih bersih dan efisien di Rust saat kita harus menangani banyak kondisi rute. Kemudian kita juga menambahkan rute `/sleep`. 
+
+```
+"GET /sleep HTTP/1.1" => {
+    thread::sleep(Duration::from_secs(10));
+    ("HTTP/1.1 200 OK", "hello.html")
+}
+```
+
+Blok kode tersebut akan menambahkan rute baru (/sleep). Ketika rute ini diakses, kita memanggil `thread::sleep` untuk membekukan eksekusi program selama 10 detik sebelum akhirnya merakit balasan status 200 OK dan mengirimkan `hello.html`. Ini berfungsi sebagai simulasi saat server sedang mengerjakan tugas komputasi berat, mengunduh data besar, atau menunggu kueri database yang lambat.
+
+Lalu blok kode `_ => ("HTTP/1.1 404 NOT FOUND", "404.html"),` akan bertindak sebagai penangkap default untuk semua rute lain yang tidak terdefinisi di atasnya, langsung mengembalikan respons 404 NOT FOUND.
+
+Kemudian ketika kita menjalankan kode tersebut, kita mencoba untuk mengakses `127.0.0.1:7878/sleep` di Tab 1 dan mengakses `127.0.0.1:7878` di Tab 2 secara bersamaan. Saat dicoba, Tab 2 akan mengalami loading yang lama dan baru menampilkan halaman setelah Tab 1 selesai memuat.
+
+Hal ini terjadi karena program server yang kita buat berjalan secara single-threaded, artinya ia hanya memiliki satu jalur eksekusi instruksi dari awal hingga akhir. Ketika Tab 1 mengakses `/sleep`, permintaan tersebut masuk ke fungsi `handle_connection`. Kemudian program akan mengeksekusi `thread::sleep(Duration::from_secs(10))`, yang menghentikan total seluruh eksekusi thread utama tersebut selama 10 detik. Kemudian pada saat yang hampir bersamaan, Tab 2 mengirimkan permintaan koneksi. Sistem operasi komputer menerima koneksi TCP dari Tab 2 dan menaruhnya di antrean (queue). Namun, karena thread utama aplikasi Rust kita sedang membeku memproses Tab 1, program tidak bisa melanjutkan iterasi pada loop `for stream in listener.incoming()` untuk mengambil dan memproses stream milik Tab 2. Akibatnya, permintaan Tab 2 sepenuhnya tertahan (blocked) hingga proses `sleep ` Tab 1 selesai, dokumen HTML dikirim ke Tab 1, dan fungsi `handle_connection` pertama selesai dieksekusi.
+
