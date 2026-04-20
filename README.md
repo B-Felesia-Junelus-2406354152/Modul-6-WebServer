@@ -121,3 +121,67 @@ warning: `hello` (bin "hello") generated 1 warning (run `cargo fix --bin "hello"
 
 Output terminal tersebut menunjukkan bahwa program berhasil dikompilasi dan berjalan dengan normal (terlihat dari pesan `Finished` dan `Running`), namun kompilator Rust memberikan sebuah pesan peringatan (warning). Peringatan bertuliskan `"unused variable: http_request"` ini muncul karena kita sudah membuat dan menyimpan data ke dalam variabel tersebut, tetapi kita tidak pernah memanggil atau menggunakannya lagi di baris kode selanjutnya.
 
+
+## Reflection Commit 3 - Validating Request and Selectively Responding
+
+![Commit 3 screen capture](/assets/images/commit3.png)
+
+```
+fn handle_connection(mut stream: TcpStream) {
+    let buf_reader = BufReader::new(&stream);
+    let request_line = buf_reader.lines().next().unwrap().unwrap();
+
+    if request_line == "GET / HTTP/1.1" {
+        let status_line = "HTTP/1.1 200 OK";
+        let contents = fs::read_to_string("hello.html").unwrap();
+        let length = contents.len();
+
+        let response = format!(
+            "{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}"
+        );
+
+        stream.write_all(response.as_bytes()).unwrap();
+    } else {
+        let status_line = "HTTP/1.1 404 NOT FOUND";
+        let contents = fs::read_to_string("404.html").unwrap();
+        let length = contents.len();
+
+        let response = format!(
+            "{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}"
+        );
+
+        stream.write_all(response.as_bytes()).unwrap();
+    }
+}
+```
+
+Pada tahap ini, kita menambahkan fitur validasi request pada server agar bisa memberikan respons yang spesifik secara selektif. Sebelumnya, server kita selalu mengembalikan `hello.html` tanpa memedulikan halaman apa yang sebenarnya diminta oleh pengguna.
+
+Untuk memberikan respons yang berbeda (halaman sukses atau halaman error), kita memeriksa baris pertama dari permintaan klien (`request_line`). Jika pengguna mengakses halaman utama, nilai `request_line` akan berupa `"GET / HTTP/1.1"`. Kita menggunakan blok logika if-else sederhana untuk memisahkan alur ini. Jika kondisinya cocok (mengakses `/`), kita menyiapkan baris status `"HTTP/1.1 200 OK"` dan memilih file `hello.html` untuk ditampilkan. Namun jika pengguna meminta jalur acak apa pun yang tidak terdaftar (misalnya mengakses `127.0.0.1:7878/bad`), maka server akan menganggap halaman tersebut tidak ada. Program akan beralih ke blok else, menyiapkan baris status `"HTTP/1.1 404 NOT FOUND"`, dan memilih file `404.html`.  
+
+*Setelah Refactoring*
+```
+fn handle_connection(mut stream: TcpStream) {
+    let buf_reader = BufReader::new(&mut stream);
+    let request_line = buf_reader.lines().next().unwrap().unwrap();
+
+    let (status_line, filename) = if request_line == "GET / HTTP/1.1" {
+        ("HTTP/1.1 200 OK", "hello.html")
+    } else {
+        ("HTTP/1.1 404 NOT FOUND", "404.html")
+    };
+    
+    let contents = fs::read_to_string(filename).unwrap();
+    let length = contents.len();
+
+    let response = format!(
+        "{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}"
+    );
+
+    stream.write_all(response.as_bytes()).unwrap();
+}
+```
+
+Ketika pertama kali mengimplementasikan logika if-else ini, kode untuk membaca file, menghitung panjang teks, menyatukan header, dan mengirimkan balasan ke stream ditulis sebanyak dua kali (satu di dalam if, satu lagi di dalam else). Pendekatan ini melanggar prinsip desain Don't Repeat Yourself (DRY).
+
+Refactoring sangat krusial dilakukan untuk menghindari kode yang repetitif. Dengan melakukan refactoring, kita menyederhanakan blok if-else sehingga hanya bertugas untuk menentukan dua variabel utama, yaitu `status_line` dan `filename`. Setelah variabel tersebut ditentukan, proses membaca file, merakit format HTTP, dan menuliskannya ke TCP stream cukup dituliskan satu kali saja di luar blok kondisi. Hasilnya, kode menjadi jauh lebih bersih, ringkas, dan lebih mudah dikembangkan jika ke depannya kita ingin menambahkan routing ke banyak halaman baru.
