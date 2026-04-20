@@ -335,3 +335,9 @@ Saat ada tugas baru dari `main.rs`, fungsi ini akan mengambil tugas tersebut lal
 6. Proses Pekerja di `Worker::new`
 Di dalam pembuatan Worker, kita menjalankan thread baru dengan `thread::spawn`. Di dalamnya terdapat loop `{ ... }` (perulangan tanpa henti). `let job = receiver.lock().unwrap().recv().unwrap();` akan memerintahkan pekerja untuk mengunci saluran penerima secara eksklusif dan menunda eksekusinya (bersiaga) hingga sebuah tugas baru berhasil ditangkap untuk diproses. Lalu pada instruksi `job();`, pekerja mengeksekusi tugas tersebut. Setelah selesai, pekerja akan kembali ke awal loop dan bersiap menerima tugas berikutnya.
 
+## Bonus Reflection  
+Pada tahap ini, dilakukan peningkatan kualitas fungsi inisialisasi `ThreadPool` dengan mengganti metode `new` menjadi `build`. Perubahan ini secara mendasar mengubah cara program menangani potensi kegagalan saat alokasi sumber daya.
+
+Fungsi new sebelumnya menggunakan instruksi `assert!(size > 0);`. Jika fungsi ini dipanggil dengan parameter `size` bernilai 0, makro `assert!` akan memicu panic, yang menyebabkan program terhenti secara mendadak dan paksa saat itu juga. Dalam arsitektur perangkat lunak yang robust, sebuah library atau komponen internal (worker pool) tidak seharusnya memiliki otoritas untuk mematikan keseluruhan program secara sepihak tanpa memberikan kesempatan bagi sistem utama untuk melakukan mitigasi.
+
+Fungsi `build` menyelesaikan masalah tersebut dengan memanfaatkan tipe data `Result<ThreadPool, PoolCreationError>` sebagai nilai kembalian. Alih-alih melakukan panic secara internal, fungsi `build` mengevaluasi parameter `size`. Jika valid, ia mengembalikan objek pool yang dibungkus dalam varian `Ok()`. Jika tidak valid `(size == 0)`, ia mengembalikan varian `Err()` yang berisi struktur error kustom (`PoolCreationError`).
